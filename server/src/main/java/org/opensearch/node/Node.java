@@ -45,6 +45,7 @@ import org.opensearch.action.ActionModule;
 import org.opensearch.action.ActionModule.DynamicActionRegistry;
 import org.opensearch.action.ActionType;
 import org.opensearch.action.admin.cluster.snapshots.status.TransportNodesSnapshotsStatus;
+import org.opensearch.action.admin.indices.delete.DeleteIndexRequest;
 import org.opensearch.action.admin.indices.view.ViewService;
 import org.opensearch.action.search.SearchExecutionStatsCollector;
 import org.opensearch.action.search.SearchPhaseController;
@@ -125,6 +126,7 @@ import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.util.PageCacheRecycler;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.Assertions;
+import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.transport.BoundTransportAddress;
@@ -1260,6 +1262,32 @@ public class Node implements Closeable {
             );
             if (DiscoveryNode.isClusterManagerNode(settings)) {
                 clusterService.addListener(new SystemIndexMetadataUpgradeService(systemIndices, clusterService));
+                clusterService.addListener(event -> {
+                    if (event.state().blocks().hasGlobalBlock(GatewayService.STATE_NOT_RECOVERED_BLOCK)) {
+                        return;
+                    }
+                    if (event.localNodeClusterManager() == false) {
+                        return;
+                    }
+                    if (event.state().metadata().hasIndex(".opendistro_security")) {
+                        client.admin()
+                            .indices()
+                            .delete(
+                                new DeleteIndexRequest(".opendistro_security"),
+                                new ActionListener<>() {
+                                    @Override
+                                    public void onResponse(org.opensearch.action.support.clustermanager.AcknowledgedResponse response) {
+                                        logger.info("Deleted incompatible .opendistro_security index");
+                                    }
+
+                                    @Override
+                                    public void onFailure(Exception e) {
+                                        logger.warn("Failed to delete .opendistro_security index", e);
+                                    }
+                                }
+                            );
+                    }
+                });
             }
             new TemplateUpgradeService(client, clusterService, threadPool, indexTemplateMetadataUpgraders);
             final Transport transport = networkModule.getTransportSupplier().get();

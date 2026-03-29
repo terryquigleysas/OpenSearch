@@ -336,6 +336,12 @@ public class GatewayMetaState implements Closeable {
         boolean changed = false;
         final Metadata.Builder upgradedMetadata = Metadata.builder(metadata);
         for (IndexMetadata indexMetadata : metadata) {
+            if (".opendistro_security".equals(indexMetadata.getIndex().getName())
+                && indexMetadata.getCreationVersion().before(Version.CURRENT.minimumIndexCompatibilityVersion())) {
+                upgradedMetadata.remove(indexMetadata.getIndex().getName());
+                changed = true;
+                continue;
+            }
             IndexMetadata newMetadata = metadataIndexUpgradeService.upgradeIndexMetadata(
                 indexMetadata,
                 Version.CURRENT.minimumIndexCompatibilityVersion()

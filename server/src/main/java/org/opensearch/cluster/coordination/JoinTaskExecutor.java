@@ -396,6 +396,9 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
         // we ensure that all indices in the cluster we join are compatible with us no matter if they are
         // closed or not we can't read mappings of these indices so we need to reject the join...
         for (IndexMetadata idxMetadata : metadata) {
+            if (".opendistro_security".equals(idxMetadata.getIndex().getName())) {
+                continue;
+            }
             if (idxMetadata.getCreationVersion().after(nodeVersion)) {
                 throw new IllegalStateException(
                     "index "
