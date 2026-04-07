@@ -77,6 +77,7 @@ import org.opensearch.cluster.applicationtemplates.SystemTemplatesPlugin;
 import org.opensearch.cluster.applicationtemplates.SystemTemplatesService;
 import org.opensearch.cluster.coordination.PersistedStateRegistry;
 import org.opensearch.cluster.metadata.AliasValidator;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexTemplateMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.MetadataCreateDataStreamService;
@@ -1269,7 +1270,10 @@ public class Node implements Closeable {
                     if (event.localNodeClusterManager() == false) {
                         return;
                     }
-                    if (event.state().metadata().hasIndex(".opendistro_security")) {
+                    IndexMetadata indexMetadata = event.state().metadata().index(".opendistro_security");
+                    if (indexMetadata != null
+                        && (indexMetadata.getCreationVersion().before(Version.CURRENT.minimumIndexCompatibilityVersion())
+                            || event.state().metadata().hasIndex(".opensearch_security"))) {
                         client.admin()
                             .indices()
                             .delete(

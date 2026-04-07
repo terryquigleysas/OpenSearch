@@ -66,6 +66,20 @@ public class NodeVersionAllocationDecider extends AllocationDecider {
 
     @Override
     public Decision canAllocate(ShardRouting shardRouting, RoutingNode node, RoutingAllocation allocation) {
+        IndexMetadata indexMetadata = allocation.metadata().getIndexSafe(shardRouting.index());
+        if (".opendistro_security".equals(indexMetadata.getIndex().getName())
+            && indexMetadata.getCreationVersion().before(node.node().getVersion().minimumIndexCompatibilityVersion())) {
+            return allocation.decision(
+                Decision.NO,
+                NAME,
+                "cannot allocate shard of index [%s] created with version [%s] to node with version [%s] "
+                    + "because the index is not compatible (minimum compatible index version is [%s])",
+                indexMetadata.getIndex().getName(),
+                indexMetadata.getCreationVersion(),
+                node.node().getVersion(),
+                node.node().getVersion().minimumIndexCompatibilityVersion()
+            );
+        }
         if (shardRouting.primary()) {
             if (replicationType == ReplicationType.SEGMENT) {
                 List<ShardRouting> replicas = allocation.routingNodes()
