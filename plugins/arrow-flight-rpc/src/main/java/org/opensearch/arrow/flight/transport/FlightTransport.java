@@ -16,13 +16,13 @@ import org.apache.arrow.flight.Location;
 import org.apache.arrow.flight.OSFlightClient;
 import org.apache.arrow.flight.OSFlightServer;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.Version;
 import org.opensearch.arrow.flight.bootstrap.ServerConfig;
 import org.opensearch.arrow.flight.bootstrap.tls.SslContextProvider;
 import org.opensearch.arrow.flight.stats.FlightStatsCollector;
+import org.opensearch.arrow.memory.ArrowAllocatorService;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.common.network.NetworkAddress;
 import org.opensearch.common.network.NetworkService;
@@ -54,8 +54,6 @@ import org.opensearch.transport.TransportKeepAlive;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.security.AccessController;
-import java.security.PrivilegedAction;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -97,12 +95,13 @@ class FlightTransport extends TcpTransport {
     private final AtomicInteger nextExecutorIndex = new AtomicInteger(0);
 
     private final ThreadPool threadPool;
-    private RootAllocator rootAllocator;
+    private BufferAllocator flightAllocator;
     private BufferAllocator serverAllocator;
     private BufferAllocator clientAllocator;
 
     private final NamedWriteableRegistry namedWriteableRegistry;
     private final FlightStatsCollector statsCollector;
+    private final ArrowAllocatorService allocatorService;
     private final FlightTransportConfig config = new FlightTransportConfig();
 
     final FlightServerMiddleware.Key<ServerHeaderMiddleware> SERVER_HEADER_KEY = FlightServerMiddleware.Key.of(
@@ -119,7 +118,8 @@ class FlightTransport extends TcpTransport {
         NetworkService networkService,
         Tracer tracer,
         SslContextProvider sslContextProvider,
-        FlightStatsCollector statsCollector
+        FlightStatsCollector statsCollector,
+        ArrowAllocatorService allocatorService
     ) {
         super(settings, version, threadPool, pageCacheRecycler, circuitBreakerService, namedWriteableRegistry, networkService, tracer);
         this.portRange = SETTING_FLIGHT_PORTS.get(settings);
@@ -127,6 +127,7 @@ class FlightTransport extends TcpTransport {
         this.publishHosts = SETTING_FLIGHT_PUBLISH_HOST.get(settings).toArray(new String[0]);
         this.sslContextProvider = sslContextProvider;
         this.statsCollector = statsCollector;
+        this.allocatorService = allocatorService;
         this.bossEventLoopGroup = createEventLoopGroup("os-grpc-boss-ELG", 1);
         this.workerEventLoopGroup = createEventLoopGroup("os-grpc-worker-ELG", Runtime.getRuntime().availableProcessors());
         this.serverExecutor = threadPool.executor(ServerConfig.GRPC_EXECUTOR_THREAD_POOL_NAME);
@@ -146,14 +147,14 @@ class FlightTransport extends TcpTransport {
     protected void doStart() {
         boolean success = false;
         try {
-            rootAllocator = AccessController.doPrivileged((PrivilegedAction<RootAllocator>) () -> new RootAllocator(Integer.MAX_VALUE));
-            serverAllocator = rootAllocator.newChildAllocator("server", 0, rootAllocator.getLimit());
-            clientAllocator = rootAllocator.newChildAllocator("client", 0, rootAllocator.getLimit());
+            flightAllocator = allocatorService.newChildAllocator("flight", Integer.MAX_VALUE);
+            serverAllocator = flightAllocator.newChildAllocator("server", 0, flightAllocator.getLimit());
+            clientAllocator = flightAllocator.newChildAllocator("client", 0, flightAllocator.getLimit());
             if (statsCollector != null) {
-                statsCollector.setBufferAllocator(rootAllocator);
+                statsCollector.setBufferAllocator(flightAllocator);
                 statsCollector.setThreadPool(threadPool);
             }
-            flightProducer = new ArrowFlightProducer(this, rootAllocator, SERVER_HEADER_KEY, statsCollector);
+            flightProducer = new ArrowFlightProducer(this, flightAllocator, SERVER_HEADER_KEY, statsCollector);
             bindServer();
             success = true;
             if (statsCollector != null) {
@@ -268,7 +269,7 @@ class FlightTransport extends TcpTransport {
             }
             serverAllocator.close();
             clientAllocator.close();
-            rootAllocator.close();
+            flightAllocator.close();
             gracefullyShutdownELG(bossEventLoopGroup, "os-grpc-boss-ELG");
             gracefullyShutdownELG(workerEventLoopGroup, "os-grpc-worker-ELG");
 

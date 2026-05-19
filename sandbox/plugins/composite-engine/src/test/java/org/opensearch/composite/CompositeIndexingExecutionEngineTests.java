@@ -18,6 +18,7 @@ import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.dataformat.DataFormatPlugin;
 import org.opensearch.index.engine.dataformat.DataFormatRegistry;
 import org.opensearch.index.engine.dataformat.RefreshInput;
+import org.opensearch.index.engine.dataformat.WriterConfig;
 import org.opensearch.index.engine.exec.commit.Committer;
 import org.opensearch.index.engine.exec.coord.CatalogSnapshot;
 import org.opensearch.test.OpenSearchTestCase;
@@ -76,7 +77,7 @@ public class CompositeIndexingExecutionEngineTests extends OpenSearchTestCase {
         when(registry.getRegisteredFormats()).thenReturn(Set.of(CompositeTestHelper.stubFormat("lucene", 1, Set.of())));
         when(registry.getIndexingEngine(any(), any())).thenAnswer(invocation -> {
             DataFormatPlugin plugin = CompositeTestHelper.stubPlugin("lucene", 1);
-            return plugin.indexingEngine(null, null);
+            return plugin.indexingEngine(null);
         });
 
         Settings settings = Settings.builder()
@@ -159,7 +160,7 @@ public class CompositeIndexingExecutionEngineTests extends OpenSearchTestCase {
 
     public void testCreateWriterReturnsCompositeWriter() throws IOException {
         CompositeIndexingExecutionEngine engine = CompositeTestHelper.createStubEngine("lucene");
-        CompositeWriter writer = (CompositeWriter) engine.createWriter(42L);
+        CompositeWriter writer = (CompositeWriter) engine.createWriter(new WriterConfig(42L));
         assertNotNull(writer);
         assertEquals(42L, writer.getWriterGeneration());
         writer.close();

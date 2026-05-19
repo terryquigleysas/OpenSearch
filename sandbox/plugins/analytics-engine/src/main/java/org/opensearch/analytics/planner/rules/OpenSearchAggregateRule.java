@@ -17,7 +17,6 @@ import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.planner.CapabilityRegistry;
-import org.opensearch.analytics.planner.FieldStorageInfo;
 import org.opensearch.analytics.planner.PlannerContext;
 import org.opensearch.analytics.planner.RelNodeUtils;
 import org.opensearch.analytics.planner.rel.AggregateCallAnnotation;
@@ -26,6 +25,7 @@ import org.opensearch.analytics.planner.rel.OpenSearchAggregate;
 import org.opensearch.analytics.planner.rel.OpenSearchRelNode;
 import org.opensearch.analytics.spi.AggregateFunction;
 import org.opensearch.analytics.spi.DelegationType;
+import org.opensearch.analytics.spi.FieldStorageInfo;
 import org.opensearch.analytics.spi.FieldType;
 
 import java.util.ArrayList;
@@ -98,7 +98,12 @@ public class OpenSearchAggregateRule extends RelOptRule {
 
         LOGGER.debug("Aggregate viable backends: {} (child viable: {})", viableBackends, childViableBackends);
 
-        RelTraitSet aggregateTraits = child.getTraitSet().replace(context.getDistributionTraitDef().singleton());
+        // Inherit the child's distribution. The split decision (PARTIAL+FINAL vs unsplit)
+        // is left to the cost model in {@link OpenSearchAggregateSplitRule}: that rule
+        // fires on every SINGLE aggregate and generates the split alternative; Volcano
+        // cost-picks between unsplit (cheaper over SINGLETON inputs) and split (cheaper
+        // over RANDOM since pre-aggregation reduces network transfer).
+        RelTraitSet aggregateTraits = child.getTraitSet();
 
         call.transformTo(
             new OpenSearchAggregate(

@@ -15,6 +15,8 @@ import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.SegmentCommitInfo;
+import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.store.Directory;
@@ -22,6 +24,8 @@ import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.store.NIOFSDirectory;
 import org.opensearch.be.lucene.index.LuceneCommitter;
 import org.opensearch.be.lucene.index.LuceneIndexingExecutionEngine;
+import org.opensearch.be.lucene.index.LuceneWriter;
+import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.IndexSettings;
@@ -99,6 +103,51 @@ public class LuceneReaderManagerTests extends OpenSearchTestCase {
     }
 
     private CatalogSnapshot stubSnapshot(long generation) {
+        return stubSnapshot(generation, List.of());
+    }
+
+    /**
+     * Builds a stub snapshot whose segment list contains the given writer generations.
+     * Each segment includes a Lucene {@link WriterFileSet} whose files match what the
+     * corresponding leaf will report from {@code SegmentCommitInfo.files()}.
+     */
+    private CatalogSnapshot stubSnapshot(long generation, List<Long> segmentGenerations) {
+        // Build segments with file sets that match the current IndexWriter's segments.
+        List<Segment> segs = buildSegmentsWithFiles(segmentGenerations);
+        return buildCatalogSnapshot(generation, segs);
+    }
+
+    @SuppressForbidden(reason = "Need reflection to read SegmentInfos for building test file sets")
+    private List<Segment> buildSegmentsWithFiles(List<Long> segmentGenerations) {
+        if (segmentGenerations.isEmpty()) {
+            return List.of();
+        }
+        try {
+            java.lang.reflect.Field segInfosField = IndexWriter.class.getDeclaredField("segmentInfos");
+            segInfosField.setAccessible(true);
+            SegmentInfos segInfos = (SegmentInfos) segInfosField.get(indexWriter);
+            List<Segment> result = new java.util.ArrayList<>();
+            for (SegmentCommitInfo sci : segInfos) {
+                String genAttr = sci.info.getAttribute(LuceneWriter.WRITER_GENERATION_ATTRIBUTE);
+                if (genAttr == null) continue;
+                long gen = Long.parseLong(genAttr);
+                if (segmentGenerations.contains(gen)) {
+                    WriterFileSet wfs = new WriterFileSet(
+                        sci.info.dir.toString(),
+                        gen,
+                        new java.util.HashSet<>(sci.files()),
+                        sci.info.maxDoc()
+                    );
+                    result.add(Segment.builder(gen).addSearchableFiles(LuceneDataFormat.LUCENE_FORMAT_NAME, wfs).build());
+                }
+            }
+            return result;
+        } catch (ReflectiveOperationException | IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private CatalogSnapshot buildCatalogSnapshot(long generation, List<Segment> segs) {
         return new CatalogSnapshot("test", generation, 1) {
             @Override
             protected void closeInternal() {}
@@ -115,7 +164,7 @@ public class LuceneReaderManagerTests extends OpenSearchTestCase {
 
             @Override
             public List<Segment> getSegments() {
-                return List.of();
+                return segs;
             }
 
             @Override
@@ -168,11 +217,36 @@ public class LuceneReaderManagerTests extends OpenSearchTestCase {
         };
     }
 
-    private void addDoc(String id) throws IOException {
+    private void addDoc(String id, long generation) throws IOException {
         Document doc = new Document();
         doc.add(new StringField("id", id, Field.Store.YES));
         indexWriter.addDocument(doc);
         indexWriter.commit();
+        stampLatestSegmentGeneration(generation);
+    }
+
+    /**
+     * Stamps the most recently written segment with the {@code writer_generation} attribute
+     * that {@link LuceneReaderManager#afterRefresh}'s assertion expects. In production this
+     * is done by {@code LuceneWriterCodec}; tests that write directly through a plain
+     * {@link IndexWriter} must stamp it themselves.
+     */
+    @SuppressForbidden(reason = "Need reflection to stamp writer_generation on segments for testing")
+    private void stampLatestSegmentGeneration(long generation) throws IOException {
+        try {
+            java.lang.reflect.Field segInfosField = IndexWriter.class.getDeclaredField("segmentInfos");
+            segInfosField.setAccessible(true);
+            SegmentInfos segInfos = (SegmentInfos) segInfosField.get(indexWriter);
+            if (segInfos.size() == 0) {
+                return;
+            }
+            SegmentCommitInfo last = segInfos.asList().get(segInfos.size() - 1);
+            if (last.info.getAttribute(LuceneWriter.WRITER_GENERATION_ATTRIBUTE) == null) {
+                last.info.putAttribute(LuceneWriter.WRITER_GENERATION_ATTRIBUTE, String.valueOf(generation));
+            }
+        } catch (ReflectiveOperationException e) {
+            throw new IOException("Failed to stamp writer_generation via reflection", e);
+        }
     }
 
     public void testAfterRefreshCreatesReader() throws IOException {
@@ -195,27 +269,33 @@ public class LuceneReaderManagerTests extends OpenSearchTestCase {
     public void testMultipleRefreshesWithIndexing() throws IOException {
         LuceneReaderManager rm = new LuceneReaderManager(dataFormat, openReader());
 
+        // Empty initial reader — no segments yet.
         CatalogSnapshot snap1 = stubSnapshot(1);
         rm.afterRefresh(true, snap1);
-        DirectoryReader reader1 = rm.getReader(snap1);
-        assertEquals(0, new IndexSearcher(reader1).count(new MatchAllDocsQuery()));
+        LuceneReader lr1 = rm.getReader(snap1);
+        assertEquals(0, new IndexSearcher(lr1.directoryReader()).count(new MatchAllDocsQuery()));
+        assertTrue(lr1.generationToSegmentName().isEmpty());
 
-        addDoc("doc1");
-        CatalogSnapshot snap2 = stubSnapshot(2);
+        // Add doc1 in generation 10, refresh.
+        addDoc("doc1", 10L);
+        CatalogSnapshot snap2 = stubSnapshot(2, List.of(10L));
         rm.afterRefresh(true, snap2);
-        DirectoryReader reader2 = rm.getReader(snap2);
-        assertEquals(1, new IndexSearcher(reader2).count(new MatchAllDocsQuery()));
+        LuceneReader lr2 = rm.getReader(snap2);
+        assertEquals(1, new IndexSearcher(lr2.directoryReader()).count(new MatchAllDocsQuery()));
+        assertNotNull(lr2.generationToSegmentName().get(10L));
 
-        assertEquals(0, new IndexSearcher(reader1).count(new MatchAllDocsQuery()));
+        assertEquals(0, new IndexSearcher(lr1.directoryReader()).count(new MatchAllDocsQuery()));
 
-        addDoc("doc2");
-        CatalogSnapshot snap3 = stubSnapshot(3);
+        // Add doc2 in generation 20.
+        addDoc("doc2", 20L);
+        CatalogSnapshot snap3 = stubSnapshot(3, List.of(10L, 20L));
         rm.afterRefresh(true, snap3);
-        DirectoryReader reader3 = rm.getReader(snap3);
-        assertEquals(2, new IndexSearcher(reader3).count(new MatchAllDocsQuery()));
+        LuceneReader lr3 = rm.getReader(snap3);
+        assertEquals(2, new IndexSearcher(lr3.directoryReader()).count(new MatchAllDocsQuery()));
+        assertEquals(2, lr3.generationToSegmentName().size());
 
-        assertNotSame(reader1, reader2);
-        assertNotSame(reader2, reader3);
+        assertNotSame(lr1, lr2);
+        assertNotSame(lr2, lr3);
 
         rm.onDeleted(snap1);
         rm.onDeleted(snap2);
@@ -227,8 +307,8 @@ public class LuceneReaderManagerTests extends OpenSearchTestCase {
         CatalogSnapshot snap = stubSnapshot(1);
         rm.afterRefresh(true, snap);
 
-        DirectoryReader reader = rm.getReader(snap);
-        assertTrue(reader.getRefCount() > 0);
+        LuceneReader lr = rm.getReader(snap);
+        assertTrue(lr.directoryReader().getRefCount() > 0);
 
         rm.onDeleted(snap);
         expectThrows(IllegalStateException.class, () -> rm.getReader(snap));
@@ -249,7 +329,7 @@ public class LuceneReaderManagerTests extends OpenSearchTestCase {
         CatalogSnapshot snap = stubSnapshot(1);
 
         rm.afterRefresh(true, snap);
-        DirectoryReader first = rm.getReader(snap);
+        LuceneReader first = rm.getReader(snap);
 
         rm.afterRefresh(true, snap);
         assertSame(first, rm.getReader(snap));
@@ -286,7 +366,7 @@ public class LuceneReaderManagerTests extends OpenSearchTestCase {
             )
             .retentionLeasesSupplier(() -> new RetentionLeases(0, 0, java.util.Collections.emptyList()))
             .build();
-        CommitterConfig cs = new CommitterConfig(engineConfig);
+        CommitterConfig cs = new CommitterConfig(engineConfig, () -> {});
         LuceneCommitter committer = new LuceneCommitter(cs);
 
         try {
@@ -300,7 +380,8 @@ public class LuceneReaderManagerTests extends OpenSearchTestCase {
                 Optional.of(engine),
                 dataFormat,
                 mock(DataFormatRegistry.class),
-                shardPath
+                shardPath,
+                Map.of()
             );
 
             EngineReaderManager<?> rm = LuceneSearchBackEnd.createReaderManager(settings);
@@ -312,7 +393,13 @@ public class LuceneReaderManagerTests extends OpenSearchTestCase {
     }
 
     public void testCreateReaderManagerWithEmptyProviderThrows() {
-        ReaderManagerConfig settings = new ReaderManagerConfig(Optional.empty(), dataFormat, mock(DataFormatRegistry.class), null);
+        ReaderManagerConfig settings = new ReaderManagerConfig(
+            Optional.empty(),
+            dataFormat,
+            mock(DataFormatRegistry.class),
+            null,
+            Map.of()
+        );
 
         IllegalStateException ex = expectThrows(IllegalStateException.class, () -> LuceneSearchBackEnd.createReaderManager(settings));
         assertTrue(ex.getMessage().contains("IndexStoreProvider is required"));

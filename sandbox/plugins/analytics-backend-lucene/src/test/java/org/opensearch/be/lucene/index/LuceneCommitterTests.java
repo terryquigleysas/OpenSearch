@@ -94,9 +94,10 @@ public class LuceneCommitterTests extends OpenSearchTestCase {
             null,
             null,
             null,
+            null,
             null
         );
-        return new CommitterConfig(engineConfig);
+        return new CommitterConfig(engineConfig, () -> {});
     }
 
     public void testConstructorOpensIndexWriter() throws IOException {

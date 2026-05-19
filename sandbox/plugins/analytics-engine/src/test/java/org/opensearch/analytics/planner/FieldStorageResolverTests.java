@@ -8,6 +8,7 @@
 
 package org.opensearch.analytics.planner;
 
+import org.opensearch.analytics.spi.FieldStorageInfo;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.common.settings.Settings;
@@ -61,7 +62,12 @@ public class FieldStorageResolverTests extends OpenSearchTestCase {
 
         IndexMetadata indexMetadata = mock(IndexMetadata.class);
         when(indexMetadata.getIndex()).thenReturn(new Index("test_index", "uuid"));
-        when(indexMetadata.getSettings()).thenReturn(Settings.builder().put("index.composite.primary_data_format", primaryFormat).build());
+        when(indexMetadata.getSettings()).thenReturn(
+            Settings.builder()
+                .put("index.composite.primary_data_format", primaryFormat)
+                .putList("index.composite.secondary_data_formats", "lucene")
+                .build()
+        );
         when(indexMetadata.mapping()).thenReturn(mappingMetadata);
 
         return new FieldStorageResolver(indexMetadata);

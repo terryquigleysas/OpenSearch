@@ -8,12 +8,12 @@
 
 use futures::{future::BoxFuture, Future, FutureExt, TryFutureExt};
 use parking_lot::RwLock;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::{
     runtime::Handle,
     sync::{oneshot::error::RecvError, Notify},
-    task::JoinSet,
+    task::{AbortHandle, JoinSet},
 };
 
 use crate::io::register_io_runtime;
@@ -33,7 +33,6 @@ pub enum JobError {
     WorkerGone,
     Panic { msg: String },
 }
-
 
 struct State {
     handle: Option<Handle>,
@@ -100,10 +99,7 @@ impl DedicatedExecutor {
         let state = State {
             handle: Some(handle),
             start_shutdown: notify_shutdown,
-            completed_shutdown: rx_shutdown
-                .map_err(Arc::new)
-                .boxed()
-                .shared(),
+            completed_shutdown: rx_shutdown.map_err(Arc::new).boxed().shared(),
             thread: Some(thread),
         };
         Self {
@@ -116,16 +112,31 @@ impl DedicatedExecutor {
         T: Future + Send + 'static,
         T::Output: Send + 'static,
     {
+        let (_abort_handle, fut) = self.spawn_with_abort_handle(task);
+        fut
+    }
+
+
+    /// Like [`spawn`](Self::spawn), but also returns an [`AbortHandle`] that
+    /// can be used to cancel the CPU task from outside (e.g. from `cancel_query`).
+    pub fn spawn_with_abort_handle<T>(
+        &self,
+        task: T,
+    ) -> (Option<AbortHandle>, impl Future<Output = Result<T::Output, JobError>>)
+    where
+        T: Future + Send + 'static,
+        T::Output: Send + 'static,
+    {
         let handle = {
             let state = self.state.read();
             state.handle.clone()
         };
         let Some(handle) = handle else {
-            return futures::future::err(JobError::WorkerGone).boxed();
+            return (None, futures::future::err(JobError::WorkerGone).boxed());
         };
         let mut join_set = JoinSet::new();
-        join_set.spawn_on(task, &handle);
-        async move {
+        let abort_handle = join_set.spawn_on(task, &handle);
+        let fut = async move {
             join_set
                 .join_next()
                 .await
@@ -144,9 +155,9 @@ impl DedicatedExecutor {
                     Err(_) => JobError::WorkerGone,
                 })
         }
-        .boxed()
+        .boxed();
+        (Some(abort_handle), fut)
     }
-
     pub fn join_blocking(&self) {
         self.shutdown();
         let thread_handle = {
@@ -156,6 +167,14 @@ impl DedicatedExecutor {
         if let Some(handle) = thread_handle {
             let _ = handle.join();
         }
+    }
+
+    /// Returns a clone of the underlying Tokio runtime `Handle`, if the
+    /// executor has not been shut down. Used to create a
+    /// `tokio_metrics::RuntimeMonitor` for the CPU runtime.
+    pub fn handle(&self) -> Option<Handle> {
+        let state = self.state.read();
+        state.handle.clone()
     }
 
     pub fn shutdown(&self) {
@@ -189,7 +208,10 @@ mod tests {
     async fn test_spawn_runs_on_different_thread() {
         let exec = test_exec(1);
         let caller_id = std::thread::current().id();
-        let spawned_id = exec.spawn(async { std::thread::current().id() }).await.unwrap();
+        let spawned_id = exec
+            .spawn(async { std::thread::current().id() })
+            .await
+            .unwrap();
         assert_ne!(caller_id, spawned_id);
         exec.join_blocking();
     }
@@ -200,11 +222,17 @@ mod tests {
         let exec = test_exec(2);
         let t1 = exec.spawn({
             let b = barrier.clone();
-            async move { b.wait(); 11 }
+            async move {
+                b.wait();
+                11
+            }
         });
         let t2 = exec.spawn({
             let b = barrier.clone();
-            async move { b.wait(); 22 }
+            async move {
+                b.wait();
+                22
+            }
         });
         barrier.wait();
         assert_eq!(t1.await.unwrap(), 11);
